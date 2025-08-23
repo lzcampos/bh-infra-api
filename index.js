@@ -6,6 +6,7 @@ import fetch from "node-fetch";
 import { wktToGeoJSON } from "@terraformer/wkt"
 import proj4 from "proj4";
 import turf from "turf";
+import pointToLineDistance from "@turf/point-to-line-distance";
 import { spawn } from "child_process";
 
 // CRS: SIRGAS2000 / UTM zone 23S (EPSG:31983) → WGS84
@@ -45,55 +46,86 @@ async function geocodeFromViaCep(via) {
   return [parseFloat(res[0].lon), parseFloat(res[0].lat)];
 }
 
-function transformCoordinatesRecursive(coords) {
-  if (typeof coords[0] === "number") {
-    const [x, y] = coords;
-    return proj4("EPSG:4326","EPSG:31983", [x, y]);
+// Euclidean distance from point to segment
+function pointToSegmentDistance(px, py, x1, y1, x2, y2) {
+  const apx = px - x1;
+  const apy = py - y1;
+  const abx = x2 - x1;
+  const aby = y2 - y1;
+
+  const ab2 = abx * abx + aby * aby;
+  if (ab2 === 0) {
+    // segment is a single point
+    const dx = px - x1;
+    const dy = py - y1;
+    return { dist: Math.hypot(dx, dy), cx: x1, cy: y1 };
   }
-  return coords.map(transformCoordinatesRecursive);
+
+  // Projection factor t of P onto AB
+  let t = (apx * abx + apy * aby) / ab2;
+  if (t < 0) t = 0;
+  else if (t > 1) t = 1;
+
+  const cx = x1 + t * abx;
+  const cy = y1 + t * aby;
+
+  const dx = px - cx;
+  const dy = py - cy;
+
+  return { dist: Math.hypot(dx, dy), cx, cy };
 }
 
-function transformGeometryToWGS84(geom) {
-  if (!geom || !geom.type || !geom.coordinates) return geom;
-  return { ...geom, coordinates: transformCoordinatesRecursive(geom.coordinates) };
-}
+// Main function: distance from point to polyline
+function pointToLineStringDistance(point, line) {
+  let minDist = Infinity;
+  let closestPoint = null;
 
-function booleanPointInAnyPolygon(point, geom) {
-  if (!geom) return false;
-  if (geom.type === "Polygon") {
-    console.log("coordinates", geom.coordinates);
-    const poly = { type: "Feature", geometry: { type: "Polygon", coordinates: geom.coordinates } };
-    return turf.booleanPointInPolygon(point, poly);
-  }
-  if (geom.type === "MultiPolygon") {
-    for (const polyCoords of geom.coordinates) {
-      const poly = { type: "Feature", geometry: { type: "Polygon", coordinates: polyCoords } };
-      if (turf.booleanPointInPolygon(point, poly)) return true;
+  for (let i = 0; i < line.length - 1; i++) {
+    const [x1, y1] = line[i];
+    const [x2, y2] = line[i + 1];
+    const { dist, cx, cy } = pointToSegmentDistance(point[0], point[1], x1, y1, x2, y2);
+    if (dist < minDist) {
+      minDist = dist;
+      closestPoint = [cx, cy];
     }
   }
-  return false;
+
+  return { distance: minDist, closestPoint };
 }
+
 
 function pointToGeometryMinDistanceMeters(point, geom) {
+  console.log("point", point);
+  console.log("geom", geom);
   if (!geom) return Infinity;
-  if (geom.type === "LineString") {
-    const line = turf.lineString(geom.coordinates);
-    return turf.pointToLineDistance(point, line, { units: "meters" });
-  }
-  if (geom.type === "MultiLineString") {
-    let min = Infinity;
-    for (const lineCoords of geom.coordinates) {
-      const line = turf.lineString(lineCoords);
-      const d = turf.pointToLineDistance(point, line, { units: "meters" });
-      if (d < min) min = d;
+  
+  if (geom.type === "LineString" && geom.coordinates && geom.coordinates.length > 1) {
+    console.log("geom.coordinates", geom.coordinates);
+    
+    // Validate and filter coordinates to ensure they're valid numbers
+    const validCoordinates = geom.coordinates.filter(coord => {
+      if (!Array.isArray(coord) || coord.length < 2) return false;
+      const [x, y] = coord;
+      return typeof x === 'number' && typeof y === 'number' && 
+             !isNaN(x) && !isNaN(y) && 
+             isFinite(x) && isFinite(y);
+    });
+    
+    if (validCoordinates.length < 2) {
+      console.log("Not enough valid coordinates for LineString");
+      return Infinity;
     }
-    return min;
+    
+    console.log("validCoordinates", validCoordinates);
+    
+    try {
+      return pointToLineStringDistance(point.geometry.coordinates, validCoordinates);
+    } catch (err) {
+      console.error("Error calculating distance:", err);
+      return Infinity;
+    }
   }
-  // For polygons, compute distance to outer ring as approximation
-  if (geom.type === "Polygon") {
-    const line = turf.lineString(geom.coordinates[0]);
-    return turf.pointToLineDistance(point, line, { units: "meters" });
-  }
+  
   return Infinity;
 }
 
@@ -102,53 +134,38 @@ function readCsvStreamClosestFeature(filePath, onRowGeom) {
     if (!fs.existsSync(filePath)) return resolve(null);
     let best = null;
     fs.createReadStream(filePath)
-      .pipe(csv({ separator: "\t" }))
+      .pipe(csv({ separator: ";" }))
       .on("data", (row) => {
         try {
-          const rawWkt = row.GEOMETRIA || row.Geometria || row.geometry || row.geom;
-          if (!rawWkt) return;
+          const rawWkt = row.GEOMETRIA;
+          if (!rawWkt || typeof rawWkt !== 'string' || rawWkt.trim() === '') {
+            return;
+          }
+          
           const parsed = wktToGeoJSON(rawWkt);
-          const geom = transformGeometryToWGS84(parsed);
-          const dataForCompare = onRowGeom(row, geom);
+          console.log("parsed", parsed);
+          
+          // Validate parsed geometry has valid structure
+          if (!parsed || !parsed.coordinates) {
+            console.log("Invalid geometry structure, skipping row");
+            return;
+          }
+          
+          const dataForCompare = onRowGeom(row, parsed);
+          console.log("dataForCompare", dataForCompare);
+          console.log("best", best);
           if (!dataForCompare) return;
           const { distanceMeters } = dataForCompare;
+          console.log("distanceMeters", distanceMeters);
           if (distanceMeters == null) return;
-          if (!best || distanceMeters < best.distanceMeters) best = { ...dataForCompare, row, geom };
-        } catch (_) {
-          // skip malformed row
+          if (!best || distanceMeters.distance < best.distanceMeters.distance) best = { ...dataForCompare, row, parsed };
+        } catch (err) {
+          console.log("Error processing row:", err.message);
+          console.log("Problematic row:", row);
+          // Continue processing other rows instead of throwing
         }
       })
       .on("end", () => resolve(best))
-      .on("error", reject);
-  });
-}
-
-async function ensureCepInsideKnownRegion(point) {
-  return new Promise((resolve, reject) => {
-    if (!fs.existsSync(STREETS_FILE)) return reject(Object.assign(new Error("Base de centralidade ausente"), { status: 500, code: "BASE_CENTRALIDADE_AUSENTE" }));
-    let found = false;
-    fs.createReadStream(STREETS_FILE)
-      .pipe(csv({ separator: ";" }))
-      .on("data", (row) => {
-        if (found) return; // allow stream to drain, but ignore
-        try {
-          
-          const rawWkt = row['GEOMETRIA'];
-          //console.log("rawWkt", rawWkt);
-          if (!rawWkt) return;
-          const parsed = wktToGeoJSON(rawWkt);
-          if (booleanPointInAnyPolygon(point, parsed.geom)) {
-            found = true;
-            resolve({ ok: true, row });
-          }
-        } catch (_) {
-          console.error("Error", row);
-          // ignore row errors
-        }
-      })
-      .on("end", () => {
-        if (!found) reject(Object.assign(new Error("Endereço fora da base de dados"), { status: 404, code: "ENDERECO_FORA_DA_BASE" }));
-      })
       .on("error", reject);
   });
 }
@@ -158,7 +175,7 @@ function mapIndicatorToDisponivel(value) {
   if (v === "S") return "Sim";
   if (v === "N") return "Não";
   if (v === "") return "não informado";
-  return "não informado";
+  return "não encontrado";
 }
 
 async function analyzeServiceNearest(point, serviceKey) {
@@ -168,10 +185,13 @@ async function analyzeServiceNearest(point, serviceKey) {
   const best = await readCsvStreamClosestFeature(file, (row, geom) => {
     const distanceMeters = pointToGeometryMinDistanceMeters(point, geom);
     return { distanceMeters };
-  });
+  }); 
+
+  console.log("best result for service", serviceKey, best);
+
 
   if (!best) return { disponivel: "não encontrado", tipo: undefined, data_apuracao: null };
-  if (best.distanceMeters > DISTANCE_THRESHOLD_METERS) return { disponivel: "não encontrado", tipo: undefined, data_apuracao: null };
+  if (best.distanceMeters.distance > DISTANCE_THRESHOLD_METERS) return { disponivel: "não encontrado", tipo: undefined, data_apuracao: null };
 
   const r = best.row;
 
@@ -195,6 +215,9 @@ async function analyzeServiceNearest(point, serviceKey) {
   }
   if (serviceKey === "telefone") {
     return { disponivel: mapIndicatorToDisponivel(r.IND_RT), tipo: undefined, data_apuracao: null };
+  }
+  if (serviceKey === "coleta_seletiva") {
+    return { disponivel: mapIndicatorToDisponivel(r.IND_RT), programacao: null, turno: null, distritos: null, cooperativa_responsavel: null };
   }
   return { disponivel: "não encontrado", tipo: undefined, data_apuracao: null };
 }
@@ -271,14 +294,25 @@ function startServer() {
       const [lon, lat] = await geocodeFromViaCep(via);
       console.log("lon", lon);
       console.log("lat", lat);
-      const cepPoint = turf.point([lon, lat]);
-      const cepPoint31983 = proj4("EPSG:4326",
-        "+proj=utm +zone=23 +south +ellps=GRS80 +units=m +no_defs", 
-        cepPoint.geometry?.coordinates);
-      console.log("cepPoint31983", cepPoint31983);
-
+      
+      // Validate coordinates before transformation
+      if (typeof lon !== 'number' || typeof lat !== 'number' || 
+          isNaN(lon) || isNaN(lat) || !isFinite(lon) || !isFinite(lat)) {
+        throw new Error("Coordenadas inválidas obtidas da geocodificação");
+      }
+      
+      const transformedCoords = proj4("EPSG:4326", "EPSG:31983", [lon, lat]);
+      
+      // Validate transformed coordinates
+      if (!Array.isArray(transformedCoords) || transformedCoords.length !== 2 ||
+          typeof transformedCoords[0] !== 'number' || typeof transformedCoords[1] !== 'number' ||
+          isNaN(transformedCoords[0]) || isNaN(transformedCoords[1]) ||
+          !isFinite(transformedCoords[0]) || !isFinite(transformedCoords[1])) {
+        throw new Error("Falha na transformação de coordenadas");
+      }
+      
+      const cepPoint = turf.point(transformedCoords);
       console.log("cepPoint", cepPoint);
-      await ensureCepInsideKnownRegion(cepPoint31983); // throws if outside
 
       const [iluminacao, meio_fio, pavimentacao, rede_agua, rede_esgoto, rede_eletrica, telefone] = await Promise.all([
         analyzeServiceNearest(cepPoint, "iluminacao"),
@@ -288,6 +322,7 @@ function startServer() {
         analyzeServiceNearest(cepPoint, "rede_esgoto"),
         analyzeServiceNearest(cepPoint, "rede_eletrica"),
         analyzeServiceNearest(cepPoint, "telefone"),
+        analyzeServiceNearest(cepPoint, "coleta_seletiva"),
       ]);
 
       const payload = buildSuccessResponse({ cep, via, lon, lat, services: { iluminacao, meio_fio, pavimentacao, rede_agua, rede_esgoto, rede_eletrica, telefone } });
