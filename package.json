@@ -4,7 +4,9 @@
   "main": "index.js",
   "type": "module",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "ingest": "node ingest_sqlite.js",
+    "start:sqlite": "node server_sqlite.js"
   },
   "author": "",
   "license": "ISC",
@@ -12,9 +14,11 @@
   "dependencies": {
     "@terraformer/wkt": "^2.2.1",
     "@turf/point-to-line-distance": "^7.2.0",
+    "better-sqlite3": "^12.2.0",
     "csv-parser": "^3.2.0",
     "node-fetch": "^3.3.2",
     "proj4": "^2.19.10",
-    "turf": "^3.0.14"
+    "turf": "^3.0.14",
+    "better-sqlite3": "^11.7.0"
   }
 }
