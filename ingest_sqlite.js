@@ -16,53 +16,16 @@ const FILES = [
   { file: "20250801_trecho_rede_eletrica.csv" },
   { file: "20250801_trecho_rede_esgoto.csv" },
   { file: "20250801_trecho_rede_telefonica.csv" },
+  { file: "20250801_coleta_seletiva_porta_porta.csv" },
 ];
 
-// Single superset schema (all nullable except 'source_file')
-// We store geometry as raw WKT and also as GeoJSON string for convenience
+// Schema: one row per trecho in trecho_data (id_base_trecho as PK)
+// Geometry is kept in a separate table keyed by id_base_trecho as well
 const CREATE_SQL = `
-CREATE TABLE IF NOT EXISTS infra_features (
-  id INTEGER PRIMARY KEY,
-  source_file TEXT NOT NULL,
-  id_base_trecho TEXT,
-  id_base_ip TEXT,
-  ind_ip TEXT,
-  id_base_mf TEXT,
-  ind_mf TEXT,
-  id_pav TEXT,
-  larg_inicio TEXT,
-  larg_final TEXT,
-  ind_pav TEXT,
-  lado_pav TEXT,
-  tp_pav TEXT,
-  data TEXT,
-  id_rdagu TEXT,
-  lado_rdagu TEXT,
-  ind_rdagu TEXT,
-  id_base_re TEXT,
-  ind_re TEXT,
-  id_rdesg TEXT,
-  lado_rdesg TEXT,
-  ind_rdesg TEXT,
-  id_base_rt TEXT,
-  ind_rt TEXT,
-  wkt TEXT,
-  geojson TEXT
-);
-CREATE INDEX IF NOT EXISTS idx_infra_trecho ON infra_features(id_base_trecho);
-CREATE INDEX IF NOT EXISTS idx_infra_ind_ip ON infra_features(ind_ip);
-CREATE INDEX IF NOT EXISTS idx_infra_ind_mf ON infra_features(ind_mf);
-CREATE INDEX IF NOT EXISTS idx_infra_ind_pav ON infra_features(ind_pav);
-CREATE INDEX IF NOT EXISTS idx_infra_ind_rdagu ON infra_features(ind_rdagu);
-CREATE INDEX IF NOT EXISTS idx_infra_ind_re ON infra_features(ind_re);
-CREATE INDEX IF NOT EXISTS idx_infra_ind_rdesg ON infra_features(ind_rdesg);
-CREATE INDEX IF NOT EXISTS idx_infra_ind_rt ON infra_features(ind_rt);
--- Geometry-only index table (for R-tree build)
 CREATE TABLE IF NOT EXISTS trecho_geom (
   id_base_trecho TEXT PRIMARY KEY,
   geojson TEXT
 );
--- Aggregated data table (one row per trecho with all indicators)
 CREATE TABLE IF NOT EXISTS trecho_data (
   id_base_trecho TEXT PRIMARY KEY,
   ind_ip TEXT,
@@ -71,11 +34,13 @@ CREATE TABLE IF NOT EXISTS trecho_data (
   tp_pav TEXT,
   data_pav TEXT,
   ind_rdagu TEXT,
-  data_rdagu TEXT,
   ind_rdesg TEXT,
-  data_rdesg TEXT,
   ind_re TEXT,
-  ind_rt TEXT
+  ind_rt TEXT,
+  programacao TEXT,
+  turno TEXT,
+  nome_distrito TEXT,
+  cooperativa_responsavel TEXT
 );
 `;
 
@@ -103,83 +68,158 @@ async function ingestFile(db, { file }) {
     return { inserted: 0, skipped: 0 };
   }
 
-  const insert = db.prepare(`
-    INSERT INTO infra_features (
-      source_file,
-      id_base_trecho, id_base_ip, ind_ip,
-      id_base_mf, ind_mf,
-      id_pav, larg_inicio, larg_final, ind_pav, lado_pav, tp_pav, data,
-      id_rdagu, lado_rdagu, ind_rdagu,
-      id_base_re, ind_re,
-      id_rdesg, lado_rdesg, ind_rdesg,
-      id_base_rt, ind_rt,
-      wkt, geojson
-    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+  const lower = file.toLowerCase();
+  const isIlum = lower.includes("ilum_publica");
+  const isMf = lower.includes("meio_fio");
+  const isPav = lower.includes("pavimentacao");
+  const isAgua = lower.includes("rede_agua");
+  const isEsgoto = lower.includes("rede_esgoto");
+  const isEletrica = lower.includes("rede_eletrica");
+  const isTelefone = lower.includes("rede_telefonica");
+  const isColeta = lower.includes("coleta_seletiva_porta_porta");
+
+  const upsertGeom = db.prepare(`
+    INSERT INTO trecho_geom (id_base_trecho, geojson)
+    VALUES (?, ?)
+    ON CONFLICT(id_base_trecho) DO UPDATE SET geojson=excluded.geojson
   `);
 
-  const trx = db.transaction((rows) => {
-    for (const r of rows) insert.run(r);
+  const upsertIlum = db.prepare(`
+    INSERT INTO trecho_data (id_base_trecho, ind_ip)
+    VALUES (?, ?)
+    ON CONFLICT(id_base_trecho) DO UPDATE SET ind_ip=excluded.ind_ip
+  `);
+  const upsertMf = db.prepare(`
+    INSERT INTO trecho_data (id_base_trecho, ind_mf)
+    VALUES (?, ?)
+    ON CONFLICT(id_base_trecho) DO UPDATE SET ind_mf=excluded.ind_mf
+  `);
+  const upsertPav = db.prepare(`
+    INSERT INTO trecho_data (id_base_trecho, ind_pav, tp_pav, data_pav)
+    VALUES (?, ?, ?, ?)
+    ON CONFLICT(id_base_trecho) DO UPDATE SET
+      ind_pav = COALESCE(NULLIF(excluded.ind_pav, ''), trecho_data.ind_pav),
+      tp_pav = COALESCE(NULLIF(excluded.tp_pav, ''), trecho_data.tp_pav),
+      data_pav = CASE
+        WHEN COALESCE(NULLIF(excluded.data_pav, ''), '') = '' THEN trecho_data.data_pav
+        WHEN trecho_data.data_pav IS NULL OR trecho_data.data_pav < excluded.data_pav THEN excluded.data_pav
+        ELSE trecho_data.data_pav
+      END
+  `);
+  const upsertAgua = db.prepare(`
+    INSERT INTO trecho_data (id_base_trecho, ind_rdagu)
+    VALUES (?, ?)
+    ON CONFLICT(id_base_trecho) DO UPDATE SET
+      ind_rdagu = COALESCE(NULLIF(excluded.ind_rdagu, ''), trecho_data.ind_rdagu)
+  `);
+  const upsertEsgoto = db.prepare(`
+    INSERT INTO trecho_data (id_base_trecho, ind_rdesg)
+    VALUES (?, ?)
+    ON CONFLICT(id_base_trecho) DO UPDATE SET
+      ind_rdesg = COALESCE(NULLIF(excluded.ind_rdesg, ''), trecho_data.ind_rdesg)
+  `);
+  const upsertEletrica = db.prepare(`
+    INSERT INTO trecho_data (id_base_trecho, ind_re)
+    VALUES (?, ?)
+    ON CONFLICT(id_base_trecho) DO UPDATE SET ind_re=excluded.ind_re
+  `);
+  const upsertTelefone = db.prepare(`
+    INSERT INTO trecho_data (id_base_trecho, ind_rt)
+    VALUES (?, ?)
+    ON CONFLICT(id_base_trecho) DO UPDATE SET ind_rt=excluded.ind_rt
+  `);
+  const upsertColeta = db.prepare(`
+    INSERT INTO trecho_data (id_base_trecho, programacao, turno, nome_distrito, cooperativa_responsavel)
+    VALUES (?, ?, ?, ?, ?)
+    ON CONFLICT(id_base_trecho) DO UPDATE SET
+      programacao=excluded.programacao,
+      turno=excluded.turno,
+      nome_distrito=excluded.nome_distrito,
+      cooperativa_responsavel=excluded.cooperativa_responsavel
+  `);
+
+  const geomBatch = [];
+  const dataBatch = [];
+  let processed = 0;
+  let skipped = 0;
+
+  const flush = db.transaction(() => {
+    for (const [id, geojson] of geomBatch.splice(0)) upsertGeom.run(id, geojson);
+    for (const { type, params } of dataBatch.splice(0)) {
+      switch (type) {
+        case "ilum": upsertIlum.run(...params); break;
+        case "mf": upsertMf.run(...params); break;
+        case "pav": upsertPav.run(...params); break;
+        case "agua": upsertAgua.run(...params); break;
+        case "esgoto": upsertEsgoto.run(...params); break;
+        case "eletrica": upsertEletrica.run(...params); break;
+        case "telefone": upsertTelefone.run(...params); break;
+        case "coleta": upsertColeta.run(...params); break;
+      }
+    }
   });
 
   return new Promise((resolve, reject) => {
-    const rowsBuffer = [];
-    let inserted = 0;
-    let skipped = 0;
-
     fs.createReadStream(filePath)
       .pipe(csv({ separator: ";" }))
       .on("data", (row) => {
         try {
+          const id = normalizeKey(row.ID_BASE_TRECHO);
+          if (!id) { skipped++; return; }
+
+          // geometry
           const wkt = normalizeKey(row.GEOMETRIA);
           const geo = parseGeometryWktToGeoJSON(wkt);
-          if (!geo) {
-            skipped++;
-            return;
+          if (geo) {
+            geomBatch.push([id, JSON.stringify(geo)]);
           }
 
-          const payload = [
-            file,
-            normalizeKey(row.ID_BASE_TRECHO),
-            normalizeKey(row.ID_BASE_IP),
-            normalizeKey(row.IND_IP),
-            normalizeKey(row.ID_BASE_MF),
-            normalizeKey(row.IND_MF),
-            normalizeKey(row.ID_PAV),
-            normalizeKey(row.LARG_INICIO),
-            normalizeKey(row.LARG_FINAL),
-            normalizeKey(row.IND_PAV),
-            normalizeKey(row.LADO_PAV),
-            normalizeKey(row.TP_PAV),
-            normalizeKey(row.DATA),
-            normalizeKey(row.ID_RDAGU),
-            normalizeKey(row.LADO_RDAGU),
-            normalizeKey(row.IND_RDAGU),
-            normalizeKey(row.ID_BASE_RE),
-            normalizeKey(row.IND_RE),
-            normalizeKey(row.ID_RDESG),
-            normalizeKey(row.LADO_RDESG),
-            normalizeKey(row.IND_RDESG),
-            normalizeKey(row.ID_BASE_RT),
-            normalizeKey(row.IND_RT),
-            wkt,
-            JSON.stringify(geo),
-          ];
-
-          rowsBuffer.push(payload);
-          if (rowsBuffer.length >= 1000) {
-            trx(rowsBuffer.splice(0));
-            inserted += 1000;
+          if (isIlum) {
+            dataBatch.push({ type: "ilum", params: [id, normalizeKey(row.IND_IP)] });
+          } else if (isMf) {
+            dataBatch.push({ type: "mf", params: [id, normalizeKey(row.IND_MF)] });
+          } else if (isPav) {
+            dataBatch.push({ type: "pav", params: [
+              id,
+              normalizeKey(row.IND_PAV),
+              normalizeKey(row.TP_PAV),
+              normalizeKey(row.DATA),
+            ] });
+          } else if (isAgua) {
+            dataBatch.push({ type: "agua", params: [
+              id,
+              normalizeKey(row.IND_RDAGU),
+            ] });
+          } else if (isEsgoto) {
+            dataBatch.push({ type: "esgoto", params: [
+              id,
+              normalizeKey(row.IND_RDESG),
+            ] });
+          } else if (isEletrica) {
+            dataBatch.push({ type: "eletrica", params: [id, normalizeKey(row.IND_RE)] });
+          } else if (isTelefone) {
+            dataBatch.push({ type: "telefone", params: [id, normalizeKey(row.IND_RT)] });
+          } else if (isColeta) {
+            dataBatch.push({ type: "coleta", params: [
+              id,
+              normalizeKey(row.PROGRAMACAO),
+              normalizeKey(row.TURNO),
+              normalizeKey(row.NOME_DISTRITO),
+              normalizeKey(row.COOPERATIVA_RESPONSAVEL),
+            ] });
+          } else {
+            // unknown file type; ignore
           }
+
+          processed++;
+          if ((geomBatch.length + dataBatch.length) >= 1000) flush();
         } catch (e) {
           skipped++;
         }
       })
       .on("end", () => {
-        if (rowsBuffer.length) {
-          trx(rowsBuffer);
-          inserted += rowsBuffer.length;
-        }
-        resolve({ inserted, skipped });
+        if (geomBatch.length || dataBatch.length) flush();
+        resolve({ inserted: processed, skipped });
       })
       .on("error", reject);
   });
@@ -203,59 +243,12 @@ async function main() {
   let totalInserted = 0;
   let totalSkipped = 0;
   for (const f of FILES) {
-    // eslint-disable-next-line no-console
     console.log(`ingesting ${f.file}...`);
     const { inserted, skipped } = await ingestFile(db, f);
     totalInserted += inserted;
     totalSkipped += skipped;
-    // eslint-disable-next-line no-console
-    console.log(`done ${f.file}: inserted=${inserted} skipped=${skipped}`);
+    console.log(`done ${f.file}: processed=${inserted} skipped=${skipped}`);
   }
-
-  // Build aggregated tables from infra_features
-  // Reset current snapshot
-  db.exec(`DELETE FROM trecho_geom;`);
-  db.exec(`DELETE FROM trecho_data;`);
-
-  // Geometry: pick one representative non-empty geometry per trecho
-  db.exec(`
-    INSERT INTO trecho_geom (id_base_trecho, geojson)
-    SELECT id_base_trecho,
-           MAX(CASE WHEN geojson IS NOT NULL AND geojson != '' THEN geojson END) AS geojson
-    FROM infra_features
-    WHERE id_base_trecho IS NOT NULL AND id_base_trecho != ''
-    GROUP BY id_base_trecho;
-  `);
-
-  // Data: aggregate first non-empty indicator per category
-  db.exec(`
-    INSERT INTO trecho_data (
-      id_base_trecho,
-      ind_ip,
-      ind_mf,
-      ind_pav, tp_pav, data_pav,
-      ind_rdagu, data_rdagu,
-      ind_rdesg, data_rdesg,
-      ind_re,
-      ind_rt
-    )
-    SELECT
-      id_base_trecho,
-      MAX(CASE WHEN ind_ip IS NOT NULL AND ind_ip != '' THEN ind_ip END) AS ind_ip,
-      MAX(CASE WHEN ind_mf IS NOT NULL AND ind_mf != '' THEN ind_mf END) AS ind_mf,
-      MAX(CASE WHEN ind_pav IS NOT NULL AND ind_pav != '' THEN ind_pav END) AS ind_pav,
-      MAX(CASE WHEN ind_pav IS NOT NULL AND ind_pav != '' THEN tp_pav END) AS tp_pav,
-      MAX(CASE WHEN ind_pav IS NOT NULL AND ind_pav != '' THEN data END) AS data_pav,
-      MAX(CASE WHEN ind_rdagu IS NOT NULL AND ind_rdagu != '' THEN ind_rdagu END) AS ind_rdagu,
-      MAX(CASE WHEN ind_rdagu IS NOT NULL AND ind_rdagu != '' THEN data END) AS data_rdagu,
-      MAX(CASE WHEN ind_rdesg IS NOT NULL AND ind_rdesg != '' THEN ind_rdesg END) AS ind_rdesg,
-      MAX(CASE WHEN ind_rdesg IS NOT NULL AND ind_rdesg != '' THEN data END) AS data_rdesg,
-      MAX(CASE WHEN ind_re IS NOT NULL AND ind_re != '' THEN ind_re END) AS ind_re,
-      MAX(CASE WHEN ind_rt IS NOT NULL AND ind_rt != '' THEN ind_rt END) AS ind_rt
-    FROM infra_features
-    WHERE id_base_trecho IS NOT NULL AND id_base_trecho != ''
-    GROUP BY id_base_trecho;
-  `);
 
   // Simple metadata table
   db.exec(`CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT);`);
@@ -263,10 +256,11 @@ async function main() {
   setMeta.run("generated_at", new Date().toISOString());
   setMeta.run("source", "csv");
 
-  // eslint-disable-next-line no-console
-  console.log(`All done. Inserted=${totalInserted} Skipped=${totalSkipped}. DB: ${DB_PATH}`);
-  console.log(`Trecho geom: ${db.prepare("SELECT COUNT(*) FROM trecho_geom").get().length}`);
-  console.log(`Trecho data: ${db.prepare("SELECT COUNT(*) FROM trecho_data").get().length}`);
+  console.log(`All done. Processed=${totalInserted} Skipped=${totalSkipped}. DB: ${DB_PATH}`);
+  const cntGeom = db.prepare("SELECT COUNT(*) AS c FROM trecho_geom").get().c;
+  const cntData = db.prepare("SELECT COUNT(*) AS c FROM trecho_data").get().c;
+  console.log(`Trecho geom: ${cntGeom}`);
+  console.log(`Trecho data: ${cntData}`);
 }
 
 main().catch((err) => {
