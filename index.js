@@ -216,43 +216,61 @@ function findNearestTrecho(trechoData, pointXY, { maxRadius = 2000, targetCount 
   return { bestDist, bestItem };
 }
 
-function buildSuccessResponse({ cep, via, lon, lat, services }) {
+function buildSuccessResponse({ cep, via, lon, lat, bestItem, noHit }) {
+  if (noHit) {
+    return {
+      cep,
+      logradouro: via.logradouro || "",
+      bairro: via.bairro || "",
+      latitude: String(lat),
+      longitude: String(lon),
+      servicos: {
+        iluminacao: { disponivel: "não encontrado" },
+        meio_fio: { disponivel: "não encontrado" },
+        pavimentacao: { disponivel: "não encontrado", tipo: "não informado", data_apuracao: null },
+        rede_agua: { disponivel: "não encontrado" },
+        rede_esgoto: { disponivel: "não encontrado" },
+        rede_eletrica: { disponivel: "não encontrado" },
+        telefone: { disponivel: "não encontrado" },
+        coleta_seletiva: { disponivel: "não encontrado", programacao: null, turno: null, distritos: null, cooperativa_responsavel: null },
+      },
+    };
+  }
+
+  const iluminacao = { disponivel: mapIndicatorToDisponivel(bestItem.ind_ip) };
+  const meio_fio = { disponivel: mapIndicatorToDisponivel(bestItem.ind_mf) };
+
+  let pavDisponivel;
+  const pavRaw = mapIndicatorToDisponivel(bestItem.ind_pav);
+  if (pavRaw === "Sim" || pavRaw === "Não") {
+    pavDisponivel = pavRaw;
+  } else if ((bestItem.tp_pav || "").toString().trim() !== "") {
+    pavDisponivel = "Sim";
+  } else {
+    pavDisponivel = pavRaw;
+  }
+  const pavimentacao = { disponivel: pavDisponivel, tipo: bestItem.tp_pav || "não informado", data_apuracao: bestItem.data_pav || null };
+
+  const rede_agua = { disponivel: mapIndicatorToDisponivel(bestItem.ind_rdagu) };
+  const rede_esgoto = { disponivel: mapIndicatorToDisponivel(bestItem.ind_rdesg) };
+  const rede_eletrica = { disponivel: mapIndicatorToDisponivel(bestItem.ind_re) };
+  const telefone = { disponivel: mapIndicatorToDisponivel(bestItem.ind_rt) };
+
+  const coleta_seletiva = {
+    disponivel: mapColetaDisponivel(bestItem.programacao, bestItem.turno, bestItem.nome_distrito, bestItem.cooperativa_responsavel),
+    programacao: bestItem.programacao || null,
+    turno: bestItem.turno || null,
+    distritos: bestItem.nome_distrito || null,
+    cooperativa_responsavel: bestItem.cooperativa_responsavel || null,
+  };
+
   return {
     cep,
     logradouro: via.logradouro || "",
     bairro: via.bairro || "",
     latitude: String(lat),
     longitude: String(lon),
-    servicos: {
-      iluminacao: { disponivel: services.iluminacao?.disponivel || "não encontrado" },
-      meio_fio: {
-        disponivel: services.meio_fio?.disponivel || "não encontrado"
-      },
-      pavimentacao: {
-        disponivel: services.pavimentacao?.disponivel || "não encontrado",
-        tipo: services.pavimentacao?.tipo || "não informado",
-        data_apuracao: services.pavimentacao?.data_apuracao || null,
-      },
-      rede_agua: {
-        disponivel: services.rede_agua?.disponivel || "não encontrado"
-      },
-      rede_esgoto: {
-        disponivel: services.rede_esgoto?.disponivel || "não encontrado"
-      },
-      rede_eletrica: {
-        disponivel: services.rede_eletrica?.disponivel || "não encontrado"
-      },
-      telefone: {
-        disponivel: services.telefone?.disponivel || "não encontrado"
-      },
-      coleta_seletiva: {
-        disponivel: services.coleta_seletiva?.disponivel || "não encontrado",
-        programacao: services.coleta_seletiva?.programacao || null,
-        turno: services.coleta_seletiva?.turno || null,
-        distritos: services.coleta_seletiva?.distritos || null,
-        cooperativa_responsavel: services.coleta_seletiva?.cooperativa_responsavel || null,
-      },
-    },
+    servicos: { iluminacao, meio_fio, pavimentacao, rede_agua, rede_esgoto, rede_eletrica, telefone, coleta_seletiva },
   };
 }
 
@@ -266,7 +284,6 @@ const TRECHO_DATA = loadTrechoIndex();
 function startServer() {
   const server = http.createServer(async (req, res) => {
     try {
-      console.time("sendJson");
       const url = new URL(req.url, "http://localhost");
       if (req.method !== "GET" || url.pathname !== "/infra") {
         sendJson(res, 404, { error: "ROTA_NAO_ENCONTRADA", message: "Rota não encontrada" });
@@ -289,42 +306,9 @@ function startServer() {
       if (!Number.isFinite(x) || !Number.isFinite(y)) throw new Error("Falha na transformação de coordenadas");
 
       const { bestDist, bestItem } = findNearestTrecho(TRECHO_DATA, [x, y]);
-      console.log(bestItem, bestDist);
       const noHit = !bestItem || bestDist > DISTANCE_THRESHOLD_METERS;
 
-      const iluminacao = noHit ? { disponivel: "não encontrado" } : { disponivel: mapIndicatorToDisponivel(bestItem.ind_ip) };
-      const meio_fio = noHit ? { disponivel: "não encontrado", data_apuracao: null } : { disponivel: mapIndicatorToDisponivel(bestItem.ind_mf)};
-      let pavDisponivel = "não encontrado";
-      if (!noHit) {
-        const raw = mapIndicatorToDisponivel(bestItem.ind_pav);
-        if (raw === "Sim" || raw === "Não") {
-          pavDisponivel = raw;
-        } else if ((bestItem.tp_pav || "").toString().trim() !== "") {
-          pavDisponivel = "Sim";
-        } else {
-          pavDisponivel = raw;
-        }
-      }
-      const pavimentacao = noHit ? { disponivel: "não encontrado", tipo: "não informado", data_apuracao: null } : { disponivel: pavDisponivel, tipo: bestItem.tp_pav || "não informado", data_apuracao: bestItem.data_pav || null };
-      const rede_agua = noHit ? { disponivel: "não encontrado" } : { disponivel: mapIndicatorToDisponivel(bestItem.ind_rdagu) };
-      const rede_esgoto = noHit ? { disponivel: "não encontrado" } : { disponivel: mapIndicatorToDisponivel(bestItem.ind_rdesg) };
-      const rede_eletrica = noHit ? { disponivel: "não encontrado", data_apuracao: null } : { disponivel: mapIndicatorToDisponivel(bestItem.ind_re), data_apuracao: null };
-      const telefone = noHit ? { disponivel: "não encontrado", data_apuracao: null } : { disponivel: mapIndicatorToDisponivel(bestItem.ind_rt), data_apuracao: null };
-      const coleta_seletiva = noHit ? {
-        disponivel: "não encontrado",
-        programacao: null,
-        turno: null,
-        distritos: null,
-        cooperativa_responsavel: null,
-      } : {
-        disponivel: mapColetaDisponivel(bestItem.programacao, bestItem.turno, bestItem.nome_distrito, bestItem.cooperativa_responsavel),
-        programacao: bestItem.programacao || null,
-        turno: bestItem.turno || null,
-        distritos: bestItem.nome_distrito || null,
-        cooperativa_responsavel: bestItem.cooperativa_responsavel || null,
-      };
-
-      const payload = buildSuccessResponse({ cep, via, lon, lat, services: { iluminacao, meio_fio, pavimentacao, rede_agua, rede_esgoto, rede_eletrica, telefone, coleta_seletiva } });
+      const payload = buildSuccessResponse({ cep, via, lon, lat, bestItem, noHit });
       sendJson(res, 200, payload);
     } catch (err) {
       const status = err?.status || 500;
