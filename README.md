@@ -2,6 +2,10 @@
 
 API para consultar disponibilidade de serviços urbanos por CEP em Belo Horizonte.
 
+Todos os dados foram coletados a partir dos dados abertos de Belo Horizonte(https://dados.pbh.gov.br/dataset/)
+
+Os dados são ingeridos e agregados em tabelas SQLite, e, posteriormente, carregados em memória para maior performance ao calcular distâncias a partir de coordenadas.
+
 ### Requisitos
 - Node.js 18+
 - npm
@@ -30,7 +34,7 @@ npm run ingest
 
 ### Executando a API
 ```bash
-node index.js
+node run start
 ```
 A API escuta em `http://localhost:3002`.
 
