@@ -57,6 +57,26 @@ CREATE INDEX IF NOT EXISTS idx_infra_ind_rdagu ON infra_features(ind_rdagu);
 CREATE INDEX IF NOT EXISTS idx_infra_ind_re ON infra_features(ind_re);
 CREATE INDEX IF NOT EXISTS idx_infra_ind_rdesg ON infra_features(ind_rdesg);
 CREATE INDEX IF NOT EXISTS idx_infra_ind_rt ON infra_features(ind_rt);
+-- Geometry-only index table (for R-tree build)
+CREATE TABLE IF NOT EXISTS trecho_geom (
+  id_base_trecho TEXT PRIMARY KEY,
+  geojson TEXT
+);
+-- Aggregated data table (one row per trecho with all indicators)
+CREATE TABLE IF NOT EXISTS trecho_data (
+  id_base_trecho TEXT PRIMARY KEY,
+  ind_ip TEXT,
+  ind_mf TEXT,
+  ind_pav TEXT,
+  tp_pav TEXT,
+  data_pav TEXT,
+  ind_rdagu TEXT,
+  data_rdagu TEXT,
+  ind_rdesg TEXT,
+  data_rdesg TEXT,
+  ind_re TEXT,
+  ind_rt TEXT
+);
 `;
 
 function normalizeKey(key) {
@@ -192,6 +212,51 @@ async function main() {
     console.log(`done ${f.file}: inserted=${inserted} skipped=${skipped}`);
   }
 
+  // Build aggregated tables from infra_features
+  // Reset current snapshot
+  db.exec(`DELETE FROM trecho_geom;`);
+  db.exec(`DELETE FROM trecho_data;`);
+
+  // Geometry: pick one representative non-empty geometry per trecho
+  db.exec(`
+    INSERT INTO trecho_geom (id_base_trecho, geojson)
+    SELECT id_base_trecho,
+           MAX(CASE WHEN geojson IS NOT NULL AND geojson != '' THEN geojson END) AS geojson
+    FROM infra_features
+    WHERE id_base_trecho IS NOT NULL AND id_base_trecho != ''
+    GROUP BY id_base_trecho;
+  `);
+
+  // Data: aggregate first non-empty indicator per category
+  db.exec(`
+    INSERT INTO trecho_data (
+      id_base_trecho,
+      ind_ip,
+      ind_mf,
+      ind_pav, tp_pav, data_pav,
+      ind_rdagu, data_rdagu,
+      ind_rdesg, data_rdesg,
+      ind_re,
+      ind_rt
+    )
+    SELECT
+      id_base_trecho,
+      MAX(CASE WHEN ind_ip IS NOT NULL AND ind_ip != '' THEN ind_ip END) AS ind_ip,
+      MAX(CASE WHEN ind_mf IS NOT NULL AND ind_mf != '' THEN ind_mf END) AS ind_mf,
+      MAX(CASE WHEN ind_pav IS NOT NULL AND ind_pav != '' THEN ind_pav END) AS ind_pav,
+      MAX(CASE WHEN ind_pav IS NOT NULL AND ind_pav != '' THEN tp_pav END) AS tp_pav,
+      MAX(CASE WHEN ind_pav IS NOT NULL AND ind_pav != '' THEN data END) AS data_pav,
+      MAX(CASE WHEN ind_rdagu IS NOT NULL AND ind_rdagu != '' THEN ind_rdagu END) AS ind_rdagu,
+      MAX(CASE WHEN ind_rdagu IS NOT NULL AND ind_rdagu != '' THEN data END) AS data_rdagu,
+      MAX(CASE WHEN ind_rdesg IS NOT NULL AND ind_rdesg != '' THEN ind_rdesg END) AS ind_rdesg,
+      MAX(CASE WHEN ind_rdesg IS NOT NULL AND ind_rdesg != '' THEN data END) AS data_rdesg,
+      MAX(CASE WHEN ind_re IS NOT NULL AND ind_re != '' THEN ind_re END) AS ind_re,
+      MAX(CASE WHEN ind_rt IS NOT NULL AND ind_rt != '' THEN ind_rt END) AS ind_rt
+    FROM infra_features
+    WHERE id_base_trecho IS NOT NULL AND id_base_trecho != ''
+    GROUP BY id_base_trecho;
+  `);
+
   // Simple metadata table
   db.exec(`CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT);`);
   const setMeta = db.prepare(`INSERT INTO meta(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v`);
@@ -200,6 +265,8 @@ async function main() {
 
   // eslint-disable-next-line no-console
   console.log(`All done. Inserted=${totalInserted} Skipped=${totalSkipped}. DB: ${DB_PATH}`);
+  console.log(`Trecho geom: ${db.prepare("SELECT COUNT(*) FROM trecho_geom").get().length}`);
+  console.log(`Trecho data: ${db.prepare("SELECT COUNT(*) FROM trecho_data").get().length}`);
 }
 
 main().catch((err) => {

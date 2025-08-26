@@ -6,7 +6,7 @@
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1",
     "ingest": "node ingest_sqlite.js",
-    "start:sqlite": "node server_sqlite.js"
+    "start:rtree": "node index.js --watch"
   },
   "author": "",
   "license": "ISC",
@@ -19,6 +19,6 @@
     "node-fetch": "^3.3.2",
     "proj4": "^2.19.10",
     "turf": "^3.0.14",
-    "better-sqlite3": "^11.7.0"
+    "flatbush": "^4.0.0"
   }
 }

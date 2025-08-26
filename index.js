@@ -1,30 +1,15 @@
 import http from "http";
-import { URL, fileURLToPath } from "url";
-import fs from "fs";
-import csv from "csv-parser";
+import { URL } from "url";
 import fetch from "node-fetch";
-import { wktToGeoJSON } from "@terraformer/wkt"
 import proj4 from "proj4";
-import turf from "turf";
-import pointToLineDistance from "@turf/point-to-line-distance";
-import { spawn } from "child_process";
+import Database from "better-sqlite3";
+import Flatbush from "flatbush";
 
 // CRS: SIRGAS2000 / UTM zone 23S (EPSG:31983) → WGS84
 proj4.defs("EPSG:31983","+proj=utm +zone=23 +south +datum=SIRGAS2000 +units=m +no_defs");
 
-const DATA_DIR = "data";
-const STREETS_FILE = `${DATA_DIR}/20250701_trecho_logradouro.csv`;
-const FILES = {
-  iluminacao: `${DATA_DIR}/20250801_trecho_ilum_publica.csv`,
-  meio_fio: `${DATA_DIR}/20250801_trecho_meio_fio.csv`,
-  pavimentacao: `${DATA_DIR}/20250801_trecho_pavimentacao.csv`,
-  rede_agua: `${DATA_DIR}/20250801_trecho_rede_agua.csv`,
-  rede_eletrica: `${DATA_DIR}/20250801_trecho_rede_eletrica.csv`,
-  rede_esgoto: `${DATA_DIR}/20250801_trecho_rede_esgoto.csv`,
-  telefone: `${DATA_DIR}/20250801_trecho_rede_telefonica.csv`,
-};
-
-const DISTANCE_THRESHOLD_METERS = 50; // consider network "near" the address within this distance
+const DISTANCE_THRESHOLD_METERS = 50;
+const DB_PATH = new URL("./infra.db", import.meta.url).pathname;
 
 function sanitizeCep(raw) {
   const digits = String(raw || "").replace(/\D/g, "");
@@ -46,7 +31,7 @@ async function geocodeFromViaCep(via) {
   return [parseFloat(res[0].lon), parseFloat(res[0].lat)];
 }
 
-// Euclidean distance from point to segment
+// Distance helpers
 function pointToSegmentDistance(px, py, x1, y1, x2, y2) {
   const apx = px - x1;
   const apy = py - y1;
@@ -55,119 +40,49 @@ function pointToSegmentDistance(px, py, x1, y1, x2, y2) {
 
   const ab2 = abx * abx + aby * aby;
   if (ab2 === 0) {
-    // segment is a single point
     const dx = px - x1;
     const dy = py - y1;
     return { dist: Math.hypot(dx, dy), cx: x1, cy: y1 };
   }
 
-  // Projection factor t of P onto AB
   let t = (apx * abx + apy * aby) / ab2;
-  if (t < 0) t = 0;
-  else if (t > 1) t = 1;
-
+  if (t < 0) t = 0; else if (t > 1) t = 1;
   const cx = x1 + t * abx;
   const cy = y1 + t * aby;
-
   const dx = px - cx;
   const dy = py - cy;
-
   return { dist: Math.hypot(dx, dy), cx, cy };
 }
 
-// Main function: distance from point to polyline
-function pointToLineStringDistance(point, line) {
+function pointToLineStringDistance(pointXY, line) {
   let minDist = Infinity;
-  let closestPoint = null;
-
   for (let i = 0; i < line.length - 1; i++) {
     const [x1, y1] = line[i];
     const [x2, y2] = line[i + 1];
-    const { dist, cx, cy } = pointToSegmentDistance(point[0], point[1], x1, y1, x2, y2);
-    if (dist < minDist) {
-      minDist = dist;
-      closestPoint = [cx, cy];
-    }
+    const { dist } = pointToSegmentDistance(pointXY[0], pointXY[1], x1, y1, x2, y2);
+    if (dist < minDist) minDist = dist;
   }
-
-  return { distance: minDist, closestPoint };
+  return minDist;
 }
 
-
-function pointToGeometryMinDistanceMeters(point, geom) {
-  console.log("point", point);
-  console.log("geom", geom);
-  if (!geom) return Infinity;
-  
-  if (geom.type === "LineString" && geom.coordinates && geom.coordinates.length > 1) {
-    console.log("geom.coordinates", geom.coordinates);
-    
-    // Validate and filter coordinates to ensure they're valid numbers
-    const validCoordinates = geom.coordinates.filter(coord => {
-      if (!Array.isArray(coord) || coord.length < 2) return false;
-      const [x, y] = coord;
-      return typeof x === 'number' && typeof y === 'number' && 
-             !isNaN(x) && !isNaN(y) && 
-             isFinite(x) && isFinite(y);
-    });
-    
-    if (validCoordinates.length < 2) {
-      console.log("Not enough valid coordinates for LineString");
-      return Infinity;
-    }
-    
-    console.log("validCoordinates", validCoordinates);
-    
-    try {
-      return pointToLineStringDistance(point.geometry.coordinates, validCoordinates);
-    } catch (err) {
-      console.error("Error calculating distance:", err);
-      return Infinity;
-    }
+function computeGeometryMinDistance(pointXY, geometry) {
+  if (!geometry) return Infinity;
+  if (geometry.type === "LineString" && Array.isArray(geometry.coordinates)) {
+    const coords = geometry.coordinates.filter(c => Array.isArray(c) && c.length >= 2 && Number.isFinite(c[0]) && Number.isFinite(c[1]));
+    if (coords.length < 2) return Infinity;
+    return pointToLineStringDistance(pointXY, coords);
   }
-  
+  if (geometry.type === "MultiLineString" && Array.isArray(geometry.coordinates)) {
+    let best = Infinity;
+    for (const ls of geometry.coordinates) {
+      const coords = (ls || []).filter(c => Array.isArray(c) && c.length >= 2 && Number.isFinite(c[0]) && Number.isFinite(c[1]));
+      if (coords.length < 2) continue;
+      const d = pointToLineStringDistance(pointXY, coords);
+      if (d < best) best = d;
+    }
+    return best;
+  }
   return Infinity;
-}
-
-function readCsvStreamClosestFeature(filePath, onRowGeom) {
-  return new Promise((resolve, reject) => {
-    if (!fs.existsSync(filePath)) return resolve(null);
-    let best = null;
-    fs.createReadStream(filePath)
-      .pipe(csv({ separator: ";" }))
-      .on("data", (row) => {
-        try {
-          const rawWkt = row.GEOMETRIA;
-          if (!rawWkt || typeof rawWkt !== 'string' || rawWkt.trim() === '') {
-            return;
-          }
-          
-          const parsed = wktToGeoJSON(rawWkt);
-          console.log("parsed", parsed);
-          
-          // Validate parsed geometry has valid structure
-          if (!parsed || !parsed.coordinates) {
-            console.log("Invalid geometry structure, skipping row");
-            return;
-          }
-          
-          const dataForCompare = onRowGeom(row, parsed);
-          console.log("dataForCompare", dataForCompare);
-          console.log("best", best);
-          if (!dataForCompare) return;
-          const { distanceMeters } = dataForCompare;
-          console.log("distanceMeters", distanceMeters);
-          if (distanceMeters == null) return;
-          if (!best || distanceMeters.distance < best.distanceMeters.distance) best = { ...dataForCompare, row, parsed };
-        } catch (err) {
-          console.log("Error processing row:", err.message);
-          console.log("Problematic row:", row);
-          // Continue processing other rows instead of throwing
-        }
-      })
-      .on("end", () => resolve(best))
-      .on("error", reject);
-  });
 }
 
 function mapIndicatorToDisponivel(value) {
@@ -178,48 +93,111 @@ function mapIndicatorToDisponivel(value) {
   return "não encontrado";
 }
 
-async function analyzeServiceNearest(point, serviceKey) {
-  const file = FILES[serviceKey];
-  if (!file) return null;
+function computeGeometryBBox(geometry) {
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+  const consider = (coords) => {
+    for (const c of coords) {
+      if (!Array.isArray(c) || c.length < 2) continue;
+      const x = c[0];
+      const y = c[1];
+      if (!Number.isFinite(x) || !Number.isFinite(y)) continue;
+      if (x < minX) minX = x;
+      if (y < minY) minY = y;
+      if (x > maxX) maxX = x;
+      if (y > maxY) maxY = y;
+    }
+  };
+  if (!geometry) return null;
+  if (geometry.type === "LineString") {
+    consider(geometry.coordinates || []);
+  } else if (geometry.type === "MultiLineString") {
+    for (const ls of geometry.coordinates || []) consider(ls || []);
+  } else {
+    return null;
+  }
+  if (!Number.isFinite(minX) || !Number.isFinite(minY) || !Number.isFinite(maxX) || !Number.isFinite(maxY)) return null;
+  return [minX, minY, maxX, maxY];
+}
 
-  const best = await readCsvStreamClosestFeature(file, (row, geom) => {
-    const distanceMeters = pointToGeometryMinDistanceMeters(point, geom);
-    return { distanceMeters };
-  }); 
+function loadTrechoIndex() {
+  const db = new Database(DB_PATH, { readonly: true });
+  const geomStmt = db.prepare(`SELECT id_base_trecho, geojson FROM trecho_geom WHERE geojson IS NOT NULL`);
+  const dataStmt = db.prepare(`SELECT * FROM trecho_data`);
 
-  console.log("best result for service", serviceKey, best);
+  const dataMap = new Map();
+  for (const d of dataStmt.iterate()) {
+    dataMap.set(d.id_base_trecho, d);
+  }
 
+  const items = [];
+  const bboxes = [];
+  for (const row of geomStmt.iterate()) {
+    let geom;
+    try { geom = JSON.parse(row.geojson); } catch (_) { continue; }
+    const bbox = computeGeometryBBox(geom);
+    if (!bbox) continue;
+    const d = dataMap.get(row.id_base_trecho) || {};
+    items.push({
+      id_base_trecho: row.id_base_trecho,
+      geom,
+      ind_ip: d.ind_ip,
+      ind_mf: d.ind_mf,
+      ind_pav: d.ind_pav,
+      tp_pav: d.tp_pav,
+      data_pav: d.data_pav,
+      ind_rdagu: d.ind_rdagu,
+      data_rdagu: d.data_rdagu,
+      ind_rdesg: d.ind_rdesg,
+      data_rdesg: d.data_rdesg,
+      ind_re: d.ind_re,
+      ind_rt: d.ind_rt,
+    });
+    bboxes.push(bbox);
+  }
 
-  if (!best) return { disponivel: "não encontrado", tipo: undefined, data_apuracao: null };
-  if (best.distanceMeters.distance > DISTANCE_THRESHOLD_METERS) return { disponivel: "não encontrado", tipo: undefined, data_apuracao: null };
+  const index = new Flatbush(bboxes.length);
+  for (let i = 0; i < bboxes.length; i++) {
+    const [minX, minY, maxX, maxY] = bboxes[i];
+    index.add(minX, minY, maxX, maxY);
+  }
+  index.finish();
 
-  const r = best.row;
+  try { db.close(); } catch (_) {}
+  return { index, items };
+}
 
-  if (serviceKey === "iluminacao") {
-    return { disponivel: mapIndicatorToDisponivel(r.IND_IP), tipo: undefined, data_apuracao: null };
+function findNearestTrecho(trechoData, pointXY, { maxRadius = 2000, targetCount = 256 } = {}) {
+  const [x, y] = pointXY;
+  const { index, items } = trechoData;
+  if (!index || !items || !items.length) return { bestDist: Infinity, bestItem: null };
+
+  let radius = 50;
+  const seen = new Set();
+  const candidates = [];
+  while (radius <= maxRadius && candidates.length < targetCount) {
+    const ids = index.search(x - radius, y - radius, x + radius, y + radius);
+    for (const id of ids) {
+      if (!seen.has(id)) {
+        seen.add(id);
+        candidates.push(id);
+      }
+    }
+    radius *= 2;
   }
-  if (serviceKey === "meio_fio") {
-    return { disponivel: mapIndicatorToDisponivel(r.IND_MF), tipo: "não informado", data_apuracao: null };
+
+  let bestDist = Infinity;
+  let bestItem = null;
+  for (const id of candidates) {
+    const item = items[id];
+    if (!item) continue;
+    const d = computeGeometryMinDistance(pointXY, item.geom);
+    if (!Number.isFinite(d)) continue;
+    if (d < bestDist) {
+      bestDist = d;
+      bestItem = item;
+    }
   }
-  if (serviceKey === "pavimentacao") {
-    return { disponivel: mapIndicatorToDisponivel(r.IND_PAV), tipo: r.TP_PAV || "não informado", data_apuracao: r.DATA || null };
-  }
-  if (serviceKey === "rede_agua") {
-    return { disponivel: mapIndicatorToDisponivel(r.IND_RDAGU), tipo: undefined, data_apuracao: r.DATA || null };
-  }
-  if (serviceKey === "rede_esgoto") {
-    return { disponivel: mapIndicatorToDisponivel(r.IND_RDESG), tipo: undefined, data_apuracao: r.DATA || null };
-  }
-  if (serviceKey === "rede_eletrica") {
-    return { disponivel: mapIndicatorToDisponivel(r.IND_RE), tipo: undefined, data_apuracao: null };
-  }
-  if (serviceKey === "telefone") {
-    return { disponivel: mapIndicatorToDisponivel(r.IND_RT), tipo: undefined, data_apuracao: null };
-  }
-  if (serviceKey === "coleta_seletiva") {
-    return { disponivel: mapIndicatorToDisponivel(r.IND_RT), programacao: null, turno: null, distritos: null, cooperativa_responsavel: null };
-  }
-  return { disponivel: "não encontrado", tipo: undefined, data_apuracao: null };
+  return { bestDist, bestItem };
 }
 
 function buildSuccessResponse({ cep, via, lon, lat, services }) {
@@ -273,9 +251,12 @@ function sendJson(res, status, payload) {
   res.end(JSON.stringify(payload));
 }
 
+const TRECHO_DATA = loadTrechoIndex();
+
 function startServer() {
   const server = http.createServer(async (req, res) => {
     try {
+      console.time("sendJson");
       const url = new URL(req.url, "http://localhost");
       if (req.method !== "GET" || url.pathname !== "/infra") {
         sendJson(res, 404, { error: "ROTA_NAO_ENCONTRADA", message: "Rota não encontrada" });
@@ -290,40 +271,24 @@ function startServer() {
       }
 
       const via = await cepToViaCep(cep);
-      console.log("via", via);
-      const [lon, lat] = await geocodeFromViaCep(via);
-      console.log("lon", lon);
-      console.log("lat", lat);
-      
-      // Validate coordinates before transformation
-      if (typeof lon !== 'number' || typeof lat !== 'number' || 
-          isNaN(lon) || isNaN(lat) || !isFinite(lon) || !isFinite(lat)) {
-        throw new Error("Coordenadas inválidas obtidas da geocodificação");
-      }
-      
-      const transformedCoords = proj4("EPSG:4326", "EPSG:31983", [lon, lat]);
-      
-      // Validate transformed coordinates
-      if (!Array.isArray(transformedCoords) || transformedCoords.length !== 2 ||
-          typeof transformedCoords[0] !== 'number' || typeof transformedCoords[1] !== 'number' ||
-          isNaN(transformedCoords[0]) || isNaN(transformedCoords[1]) ||
-          !isFinite(transformedCoords[0]) || !isFinite(transformedCoords[1])) {
-        throw new Error("Falha na transformação de coordenadas");
-      }
-      
-      const cepPoint = turf.point(transformedCoords);
-      console.log("cepPoint", cepPoint);
 
-      const [iluminacao, meio_fio, pavimentacao, rede_agua, rede_esgoto, rede_eletrica, telefone] = await Promise.all([
-        analyzeServiceNearest(cepPoint, "iluminacao"),
-        analyzeServiceNearest(cepPoint, "meio_fio"),
-        analyzeServiceNearest(cepPoint, "pavimentacao"),
-        analyzeServiceNearest(cepPoint, "rede_agua"),
-        analyzeServiceNearest(cepPoint, "rede_esgoto"),
-        analyzeServiceNearest(cepPoint, "rede_eletrica"),
-        analyzeServiceNearest(cepPoint, "telefone"),
-        analyzeServiceNearest(cepPoint, "coleta_seletiva"),
-      ]);
+      const [lon, lat] = await geocodeFromViaCep(via);
+      if (!Number.isFinite(lon) || !Number.isFinite(lat)) throw new Error("Coordenadas inválidas");
+
+      const [x, y] = proj4("EPSG:4326", "EPSG:31983", [lon, lat]);
+      if (!Number.isFinite(x) || !Number.isFinite(y)) throw new Error("Falha na transformação de coordenadas");
+
+      const { bestDist, bestItem } = findNearestTrecho(TRECHO_DATA, [x, y]);
+      console.log(bestItem);
+      const noHit = !bestItem || bestDist > DISTANCE_THRESHOLD_METERS;
+
+      const iluminacao = noHit ? { disponivel: "não encontrado" } : { disponivel: mapIndicatorToDisponivel(bestItem.ind_ip) };
+      const meio_fio = noHit ? { disponivel: "não encontrado", tipo: "não informado", data_apuracao: null } : { disponivel: mapIndicatorToDisponivel(bestItem.ind_mf), tipo: bestItem.tp_mf || "não informado", data_apuracao: bestItem.data_mf || null };
+      const pavimentacao = noHit ? { disponivel: "não encontrado", tipo: "não informado", data_apuracao: null } : { disponivel: mapIndicatorToDisponivel(bestItem.ind_pav), tipo: bestItem.tp_pav || "não informado", data_apuracao: bestItem.data_pav || null };
+      const rede_agua = noHit ? { disponivel: "não encontrado", data_apuracao: null } : { disponivel: mapIndicatorToDisponivel(bestItem.ind_rdagu), data_apuracao: bestItem.data_rdagu || null };
+      const rede_esgoto = noHit ? { disponivel: "não encontrado", data_apuracao: null } : { disponivel: mapIndicatorToDisponivel(bestItem.ind_rdesg), data_apuracao: bestItem.data_rdesg || null };
+      const rede_eletrica = noHit ? { disponivel: "não encontrado", data_apuracao: null } : { disponivel: mapIndicatorToDisponivel(bestItem.ind_re), data_apuracao: null };
+      const telefone = noHit ? { disponivel: "não encontrado", data_apuracao: null } : { disponivel: mapIndicatorToDisponivel(bestItem.ind_rt), data_apuracao: null };
 
       const payload = buildSuccessResponse({ cep, via, lon, lat, services: { iluminacao, meio_fio, pavimentacao, rede_agua, rede_esgoto, rede_eletrica, telefone } });
       sendJson(res, 200, payload);
@@ -334,62 +299,13 @@ function startServer() {
     }
   });
 
-  const PORT = process.env.PORT ? Number(process.env.PORT) : 3000;
+  const PORT = process.env.PORT ? Number(process.env.PORT) : 3002;
   server.listen(PORT, () => {
-    // eslint-disable-next-line no-console
     console.log(`bh-infra-api listening on port ${PORT}`);
   });
   return server;
 }
 
-const DEV_MODE = process.argv.includes("--dev") || process.argv.includes("--watch") || process.env.DEV_WATCH === "1";
-const IS_WATCH_CHILD = process.env._WATCH_CHILD === "1";
+startServer();
 
-function startDevWatcher() {
-  const filePath = fileURLToPath(import.meta.url);
-  let child = null;
 
-  const spawnChild = () => {
-    child = spawn(process.execPath, [filePath], {
-      stdio: "inherit",
-      env: { ...process.env, _WATCH_CHILD: "1" },
-    });
-  };
-
-  let debounceTimer = null;
-  const restart = () => {
-    if (debounceTimer) clearTimeout(debounceTimer);
-    debounceTimer = setTimeout(() => {
-      if (child) {
-        try { child.kill(); } catch (_) {}
-      }
-      spawnChild();
-    }, 150);
-  };
-
-  const watcher = fs.watch(filePath, { persistent: true }, () => restart());
-
-  process.on("SIGINT", () => {
-    try { watcher.close(); } catch (_) {}
-    if (child) {
-      try { child.kill(); } catch (_) {}
-    }
-    process.exit(0);
-  });
-
-  process.on("SIGTERM", () => {
-    try { watcher.close(); } catch (_) {}
-    if (child) {
-      try { child.kill(); } catch (_) {}
-    }
-    process.exit(0);
-  });
-
-  spawnChild();
-}
-
-if (DEV_MODE && !IS_WATCH_CHILD) {
-  startDevWatcher();
-} else {
-  startServer();
-}
